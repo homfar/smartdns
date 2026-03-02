@@ -1,0 +1,43 @@
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS zones (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  domain TEXT UNIQUE NOT NULL,
+  enabled INTEGER NOT NULL,
+  soa_mname TEXT NOT NULL,
+  soa_rname TEXT NOT NULL,
+  soa_serial INTEGER NOT NULL,
+  soa_refresh INTEGER NOT NULL,
+  soa_retry INTEGER NOT NULL,
+  soa_expire INTEGER NOT NULL,
+  soa_minimum INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  version INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  zone_id INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  type TEXT NOT NULL,
+  ttl INTEGER NOT NULL,
+  enabled INTEGER NOT NULL,
+  data_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  version INTEGER NOT NULL,
+  UNIQUE(zone_id, name, type, data_json),
+  FOREIGN KEY(zone_id) REFERENCES zones(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS sync_audit (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  direction TEXT NOT NULL,
+  success INTEGER NOT NULL,
+  summary TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);

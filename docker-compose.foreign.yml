@@ -1,0 +1,4 @@
+services:
+  geodns:
+    extends: {file: docker-compose.yml, service: geodns}
+    environment: ["NODE_ROLE=FOREIGN"]

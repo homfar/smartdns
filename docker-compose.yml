@@ -1,0 +1,6 @@
+services:
+  geodns:
+    build: .
+    env_file: .env
+    ports: ["53:53/udp","53:53/tcp","5555:5555"]
+    volumes: ["./data:/data","./mmdb:/mmdb"]
