@@ -1,0 +1,1 @@
+<html><body><h1>Zones</h1><ul>{{range .Zones}}<li>{{.Domain}} ({{.Enabled}})</li>{{end}}</ul><form method="post" action="/zones"><input type="hidden" name="csrf" value="{{.CSRF}}"/><input name="domain" placeholder="example.com"/><input name="soa_mname" value="ns1.example.com."/><input name="soa_rname" value="hostmaster.example.com."/><button>Add</button></form></body></html>
