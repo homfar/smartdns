@@ -57,3 +57,16 @@ func AData(data string) error {
 	}
 	return errors.New("unknown a mode")
 }
+
+func AAAAData(data string) error {
+	var p map[string]any
+	if err := json.Unmarshal([]byte(data), &p); err != nil {
+		return err
+	}
+	ip, _ := p["ip"].(string)
+	parsed := net.ParseIP(ip)
+	if parsed == nil || parsed.To4() != nil {
+		return errors.New("invalid ipv6")
+	}
+	return nil
+}

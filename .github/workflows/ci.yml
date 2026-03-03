@@ -12,6 +12,12 @@ jobs:
         run: go install honnef.co/go/tools/cmd/staticcheck@2024.1.1
       - name: Format check
         run: make fmt-check
-      - name: Verify
-        run: PATH="$(go env GOPATH)/bin:$PATH" make verify
+      - name: Vet
+        run: go vet ./...
+      - name: Unit tests
+        run: go test ./...
+      - name: Race tests
+        run: go test -race ./...
+      - name: Staticcheck
+        run: PATH="$(go env GOPATH)/bin:$PATH" staticcheck ./...
       - run: go build ./cmd/geodns

@@ -29,7 +29,10 @@ func TestWildcardExactPrecedence(t *testing.T) {
 	s := setupDNSTest(t)
 	_, _ = s.db.Exec(`INSERT INTO records(zone_id,name,type,ttl,enabled,data_json,created_at,updated_at,version) VALUES(1,'*','A',60,1,'{"mode":"SINGLE","ip":"1.1.1.1"}',1,1,1)`)
 	_, _ = s.db.Exec(`INSERT INTO records(zone_id,name,type,ttl,enabled,data_json,created_at,updated_at,version) VALUES(1,'www','A',60,1,'{"mode":"SINGLE","ip":"2.2.2.2"}',1,1,1)`)
-	rrs := s.lookup(1, "www.example.com", mdns.TypeA, "example.com", "8.8.8.8")
+	rrs, err := s.lookup(1, "www.example.com", mdns.TypeA, "example.com", "8.8.8.8")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(rrs) != 1 || rrs[0].(*mdns.A).A.String() != "2.2.2.2" {
 		t.Fatalf("expected exact record, got %#v", rrs)
 	}
@@ -40,7 +43,10 @@ func TestAnyModeMinimalCap(t *testing.T) {
 	_, _ = s.db.Exec(`INSERT INTO records(zone_id,name,type,ttl,enabled,data_json,created_at,updated_at,version) VALUES(1,'@','A',60,1,'{"mode":"SINGLE","ip":"1.1.1.1"}',1,1,1)`)
 	_, _ = s.db.Exec(`INSERT INTO records(zone_id,name,type,ttl,enabled,data_json,created_at,updated_at,version) VALUES(1,'@','AAAA',60,1,'{"ip":"2001:db8::1"}',1,1,1)`)
 	_, _ = s.db.Exec(`INSERT INTO records(zone_id,name,type,ttl,enabled,data_json,created_at,updated_at,version) VALUES(1,'@','TXT',60,1,'{"texts":["x"]}',1,1,1)`)
-	rrs := s.lookup(1, "example.com", mdns.TypeANY, "example.com", "8.8.8.8")
+	rrs, err := s.lookup(1, "example.com", mdns.TypeANY, "example.com", "8.8.8.8")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(rrs) < 3 {
 		t.Fatalf("expected all records from lookup before cap")
 	}
