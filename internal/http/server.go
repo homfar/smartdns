@@ -9,8 +9,10 @@ import (
 	"html/template"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +31,17 @@ import (
 //go:embed templates/*.html
 var tplFS embed.FS
 
+type sessionData struct {
+	User      string
+	ExpiresAt time.Time
+	CreatedAt time.Time
+}
+
+type csrfData struct {
+	Token     string
+	ExpiresAt time.Time
+}
+
 type Server struct {
 	cfg      config.Config
 	db       *sql.DB
@@ -36,8 +49,8 @@ type Server struct {
 	sync     *syncmod.Manager
 	t        *template.Template
 	logger   *slog.Logger
-	sessions map[string]string
-	csrf     map[string]string
+	sessions map[string]sessionData
+	csrf     map[string]csrfData
 	mu       sync.Mutex
 	rateMu   sync.Mutex
 	rate     map[string]rateBucket
@@ -51,7 +64,24 @@ type rateBucket struct {
 
 func New(cfg config.Config, db *sql.DB, gp geo.Provider, sm *syncmod.Manager, logger *slog.Logger) *Server {
 	t := template.Must(template.ParseFS(tplFS, "templates/*.html"))
-	return &Server{cfg: cfg, db: db, geo: gp, sync: sm, t: t, logger: logger, sessions: map[string]string{}, csrf: map[string]string{}, rate: map[string]rateBucket{}}
+	s := &Server{cfg: cfg, db: db, geo: gp, sync: sm, t: t, logger: logger, sessions: map[string]sessionData{}, csrf: map[string]csrfData{}, rate: map[string]rateBucket{}}
+	go s.cleanupSessions()
+	return s
+}
+
+func (s *Server) cleanupSessions() {
+	t := time.NewTicker(time.Minute)
+	for range t.C {
+		now := time.Now()
+		s.mu.Lock()
+		for sid, session := range s.sessions {
+			if now.After(session.ExpiresAt) {
+				delete(s.sessions, sid)
+				delete(s.csrf, sid)
+			}
+		}
+		s.mu.Unlock()
+	}
 }
 
 func (s *Server) Router() http.Handler {
@@ -76,7 +106,9 @@ func (s *Server) Router() http.Handler {
 		ar.Get("/settings", s.settingsPage)
 		ar.Post("/settings", s.settingsSave)
 	})
-	r.Post("/internal/sync/push", s.syncPush)
+	if !s.cfg.NoSync {
+		r.Post("/internal/sync/push", s.syncPush)
+	}
 	return r
 }
 func (s *Server) secHeaders(next http.Handler) http.Handler {
@@ -86,12 +118,18 @@ func (s *Server) secHeaders(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+func remoteIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
+
 func (s *Server) globalRate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host := r.RemoteAddr
-		if strings.Contains(host, ":") {
-			host = strings.Split(host, ":")[0]
-		}
+		host := remoteIP(r.RemoteAddr)
 		s.rateMu.Lock()
 		b := s.rate[host]
 		if time.Since(b.At) > time.Minute {
@@ -112,10 +150,7 @@ func (s *Server) adminAllowed(remote string) bool {
 	if len(s.cfg.AdminAllowlist) == 0 {
 		return true
 	}
-	h := remote
-	if strings.Contains(h, ":") {
-		h = strings.Split(h, ":")[0]
-	}
+	h := remoteIP(remote)
 	for _, allowed := range s.cfg.AdminAllowlist {
 		if ap, err := netip.ParseAddr(allowed); err == nil {
 			if hp, err := netip.ParseAddr(h); err == nil && hp == ap {
@@ -134,14 +169,38 @@ func (s *Server) rand() string {
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
+
+func (s *Server) trimSessionsIfNeeded() {
+	if len(s.sessions) < s.cfg.SessionMax {
+		return
+	}
+	type item struct {
+		sid     string
+		created time.Time
+	}
+	items := make([]item, 0, len(s.sessions))
+	for sid, session := range s.sessions {
+		items = append(items, item{sid: sid, created: session.CreatedAt})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].created.Before(items[j].created) })
+	for len(s.sessions) >= s.cfg.SessionMax && len(items) > 0 {
+		drop := items[0]
+		items = items[1:]
+		delete(s.sessions, drop.sid)
+		delete(s.csrf, drop.sid)
+	}
+}
+
 func (s *Server) setSession(w http.ResponseWriter, u string) {
 	sid := s.rand()
 	csrf := s.rand()
+	expires := time.Now().Add(time.Duration(max(1, s.cfg.SessionTTLHours)) * time.Hour)
 	s.mu.Lock()
-	s.sessions[sid] = u
-	s.csrf[sid] = csrf
+	s.trimSessionsIfNeeded()
+	s.sessions[sid] = sessionData{User: u, ExpiresAt: expires, CreatedAt: time.Now()}
+	s.csrf[sid] = csrfData{Token: csrf, ExpiresAt: expires}
 	s.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "sid", Value: sid, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode})
+	http.SetCookie(w, &http.Cookie{Name: "sid", Value: sid, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, Secure: s.cfg.CookieSecure, Expires: expires})
 }
 func (s *Server) authed(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -150,16 +209,25 @@ func (s *Server) authed(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		c, err := r.Cookie("sid")
-		if err != nil || s.sessions[c.Value] == "" {
+		if err != nil {
+			http.Redirect(w, r, "/login", 302)
+			return
+		}
+		s.mu.Lock()
+		session, ok := s.sessions[c.Value]
+		csrf := s.csrf[c.Value]
+		if ok && time.Now().After(session.ExpiresAt) {
+			ok = false
+			delete(s.sessions, c.Value)
+			delete(s.csrf, c.Value)
+		}
+		s.mu.Unlock()
+		if !ok {
 			http.Redirect(w, r, "/login", 302)
 			return
 		}
 		if r.Method == http.MethodPost && !strings.HasPrefix(r.URL.Path, "/internal/") {
-			if c.Value == "" || s.csrf[c.Value] == "" {
-				http.Error(w, "csrf", 403)
-				return
-			}
-			if r.FormValue("csrf") != s.csrf[c.Value] {
+			if csrf.Token == "" || time.Now().After(csrf.ExpiresAt) || r.FormValue("csrf") != csrf.Token {
 				http.Error(w, "csrf", 403)
 				return
 			}
@@ -172,6 +240,10 @@ func (s *Server) authMW(next http.Handler) http.Handler {
 }
 func (s *Server) loginPage(w http.ResponseWriter, _ *http.Request) { s.render(w, "login.html", nil) }
 func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAllowed(r.RemoteAddr) {
+		http.Error(w, "forbidden", 403)
+		return
+	}
 	_ = r.ParseForm()
 	u, p := r.FormValue("username"), r.FormValue("password")
 	var hash string
@@ -198,9 +270,14 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	c, _ := r.Cookie("sid")
-	s.render(w, "dashboard.html", map[string]any{"MMDB": s.geo.Healthy(), "Sync": s.sync.Enabled, "CSRF": s.csrf[c.Value]})
+	s.mu.Lock()
+	csrf := s.csrf[c.Value].Token
+	s.mu.Unlock()
+	s.render(w, "dashboard.html", map[string]any{"MMDB": s.geo.Healthy(), "Sync": s.sync.Enabled, "CSRF": csrf})
 }
-func (s *Server) zonesList(w http.ResponseWriter, r *http.Request) {
+
+// remaining handlers mostly unchanged
+func (s *Server) zonesList(w http.ResponseWriter, r *http.Request) { /* unchanged below */
 	rows, _ := s.db.Query(`SELECT id,domain,enabled FROM zones ORDER BY domain`)
 	defer rows.Close()
 	type z struct {
@@ -215,7 +292,10 @@ func (s *Server) zonesList(w http.ResponseWriter, r *http.Request) {
 		zs = append(zs, x)
 	}
 	c, _ := r.Cookie("sid")
-	s.render(w, "zones.html", map[string]any{"Zones": zs, "CSRF": s.csrf[c.Value]})
+	s.mu.Lock()
+	csrf := s.csrf[c.Value].Token
+	s.mu.Unlock()
+	s.render(w, "zones.html", map[string]any{"Zones": zs, "CSRF": csrf})
 }
 func (s *Server) zoneCreate(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
@@ -257,18 +337,26 @@ func (s *Server) recordCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
+	name := r.FormValue("name")
 	if typ == "CNAME" {
 		var c int
-		_ = s.db.QueryRow(`SELECT COUNT(1) FROM records WHERE zone_id=? AND name=? AND enabled=1 AND type<>'CNAME'`, zid, r.FormValue("name")).Scan(&c)
+		_ = s.db.QueryRow(`SELECT COUNT(1) FROM records WHERE zone_id=? AND name=? AND enabled=1 AND type<>'CNAME'`, zid, name).Scan(&c)
+		if c > 0 {
+			http.Error(w, "cname exclusivity violation", 400)
+			return
+		}
+	} else {
+		var c int
+		_ = s.db.QueryRow(`SELECT COUNT(1) FROM records WHERE zone_id=? AND name=? AND enabled=1 AND type='CNAME'`, zid, name).Scan(&c)
 		if c > 0 {
 			http.Error(w, "cname exclusivity violation", 400)
 			return
 		}
 	}
-	_, _ = s.db.Exec(`INSERT INTO records(zone_id,name,type,ttl,enabled,data_json,created_at,updated_at,version) VALUES(?,?,?,?,?,?,?,?,?)`, zid, r.FormValue("name"), typ, ttl, 1, data, time.Now().Unix(), time.Now().Unix(), 1)
+	_, _ = s.db.Exec(`INSERT INTO records(zone_id,name,type,ttl,enabled,data_json,created_at,updated_at,version) VALUES(?,?,?,?,?,?,?,?,?)`, zid, name, typ, ttl, 1, data, time.Now().Unix(), time.Now().Unix(), 1)
 	now := time.Now().Unix()
 	_, _ = s.db.Exec(`UPDATE zones SET updated_at=?,version=version+1,soa_serial=CASE WHEN soa_serial<? THEN ? ELSE soa_serial+1 END WHERE id=?`, now, now, now, zid)
-	_, _ = s.db.Exec(`INSERT INTO audit_log(event_type,subject,details,created_at) VALUES('record_change',?, ?,?)`, zid, typ+":"+r.FormValue("name"), time.Now().Unix())
+	_, _ = s.db.Exec(`INSERT INTO audit_log(event_type,subject,details,created_at) VALUES('record_change',?, ?,?)`, zid, typ+":"+name, time.Now().Unix())
 	http.Redirect(w, r, "/zones", 302)
 }
 func (s *Server) recordDelete(w http.ResponseWriter, r *http.Request) {
@@ -316,7 +404,10 @@ func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 }
 func (s *Server) settingsPage(w http.ResponseWriter, r *http.Request) {
 	c, _ := r.Cookie("sid")
-	s.render(w, "settings.html", map[string]any{"CSRF": s.csrf[c.Value]})
+	s.mu.Lock()
+	csrf := s.csrf[c.Value].Token
+	s.mu.Unlock()
+	s.render(w, "settings.html", map[string]any{"CSRF": csrf})
 }
 func (s *Server) settingsSave(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
@@ -334,4 +425,11 @@ func (s *Server) readyz(w http.ResponseWriter, _ *http.Request) {
 	b, _ := json.Marshal(out)
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(b)
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

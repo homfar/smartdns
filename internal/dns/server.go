@@ -12,61 +12,95 @@ import (
 	"time"
 
 	mdns "github.com/miekg/dns"
+	"github.com/prometheus/client_golang/prometheus"
 	"smartdns/internal/config"
 	"smartdns/internal/geo"
 	"smartdns/internal/validate"
 )
 
+var (
+	dnsMetricsOnce sync.Once
+	dnsLatencyVec  *prometheus.HistogramVec
+	dnsRcodesVec   *prometheus.CounterVec
+	dnsQtypesVec   *prometheus.CounterVec
+)
+
 type tokenBucket struct {
-	tokens float64
-	last   time.Time
+	tokens   float64
+	last     time.Time
+	lastSeen time.Time
 }
 
 type Server struct {
-	db   *sql.DB
-	geo  geo.Provider
-	cfg  config.Config
-	addr string
-	udp  *mdns.Server
-	tcp  *mdns.Server
+	db  *sql.DB
+	geo geo.Provider
+	cfg config.Config
 
-	mu          sync.Mutex
-	rrl         map[string]*tokenBucket
-	tcpPerIP    map[string]int
-	currentTCP  atomic.Int64
+	udp []*mdns.Server
+	tcp []*mdns.Server
+
+	mu         sync.Mutex
+	rrl        map[string]*tokenBucket
+	tcpPerIP   map[string]int
+	currentTCP atomic.Int64
+
 	queryCounts map[uint16]*atomic.Uint64
-	latencyNS   []int64
+
+	dnsLatency *prometheus.HistogramVec
+	dnsRcodes  *prometheus.CounterVec
+	dnsQtypes  *prometheus.CounterVec
 }
 
 func New(db *sql.DB, gp geo.Provider, cfg config.Config) *Server {
 	qc := map[uint16]*atomic.Uint64{}
-	for _, rt := range []uint16{mdns.TypeA, mdns.TypeAAAA, mdns.TypeMX, mdns.TypeNS, mdns.TypeTXT, mdns.TypeCNAME, mdns.TypeSOA, mdns.TypeANY} {
+	for _, rt := range []uint16{mdns.TypeA, mdns.TypeAAAA, mdns.TypeMX, mdns.TypeNS, mdns.TypeTXT, mdns.TypeCNAME, mdns.TypeSOA, mdns.TypeSRV, mdns.TypeCAA, mdns.TypeANY} {
 		qc[rt] = &atomic.Uint64{}
 	}
-	return &Server{db: db, geo: gp, cfg: cfg, addr: cfg.DNSAddr, rrl: map[string]*tokenBucket{}, tcpPerIP: map[string]int{}, queryCounts: qc}
+	dnsMetricsOnce.Do(func() {
+		dnsLatencyVec = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "dns_request_duration_seconds", Help: "DNS request duration", Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25}}, []string{"proto"})
+		dnsRcodesVec = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "dns_rcode_total", Help: "DNS rcode count"}, []string{"rcode"})
+		dnsQtypesVec = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "dns_queries_total", Help: "DNS queries by qtype"}, []string{"qtype"})
+		prometheus.MustRegister(dnsLatencyVec, dnsRcodesVec, dnsQtypesVec)
+	})
+
+	addrs := cfg.DNSAddrs
+	if len(addrs) == 0 {
+		addrs = []string{cfg.DNSAddr}
+	}
+	s := &Server{db: db, geo: gp, cfg: cfg, rrl: map[string]*tokenBucket{}, tcpPerIP: map[string]int{}, queryCounts: qc, dnsLatency: dnsLatencyVec, dnsRcodes: dnsRcodesVec, dnsQtypes: dnsQtypesVec}
+	go s.cleanupRRL()
+	return s
 }
 
 func (s *Server) Start() error {
 	h := mdns.HandlerFunc(s.handle)
-	s.udp = &mdns.Server{Addr: s.addr, Net: "udp", Handler: h, ReusePort: true, UDPSize: uint16(s.cfg.DNSMaxUDPSize), ReadTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond, WriteTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond}
-	s.tcp = &mdns.Server{Addr: s.addr, Net: "tcp", Handler: h, ReusePort: true, ReadTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond, WriteTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond, MaxTCPQueries: 64}
-	go s.udp.ListenAndServe()
-	go s.tcp.ListenAndServe()
+	addrs := s.cfg.DNSAddrs
+	if len(addrs) == 0 {
+		addrs = []string{s.cfg.DNSAddr}
+	}
+	for _, addr := range addrs {
+		udp := &mdns.Server{Addr: addr, Net: "udp", Handler: h, ReusePort: true, UDPSize: uint16(s.cfg.DNSMaxUDPSize), ReadTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond, WriteTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond}
+		tcp := &mdns.Server{Addr: addr, Net: "tcp", Handler: h, ReusePort: true, ReadTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond, WriteTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond, MaxTCPQueries: 64}
+		s.udp = append(s.udp, udp)
+		s.tcp = append(s.tcp, tcp)
+		go udp.ListenAndServe()
+		go tcp.ListenAndServe()
+	}
 	return nil
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
 	var errs []error
-	if s.udp != nil {
-		errs = append(errs, s.udp.ShutdownContext(ctx))
+	for _, srv := range s.udp {
+		errs = append(errs, srv.ShutdownContext(ctx))
 	}
-	if s.tcp != nil {
-		errs = append(errs, s.tcp.ShutdownContext(ctx))
+	for _, srv := range s.tcp {
+		errs = append(errs, srv.ShutdownContext(ctx))
 	}
 	return errors.Join(errs...)
 }
 
-func (s *Server) Healthy() bool { return s.udp != nil && s.tcp != nil }
+func (s *Server) Healthy() bool { return len(s.udp) > 0 && len(s.tcp) > 0 }
 
 func LongestZone(name string, zones []string) string {
 	name = strings.TrimSuffix(strings.ToLower(name), ".")
@@ -81,24 +115,41 @@ func LongestZone(name string, zones []string) string {
 	return best
 }
 
+func (s *Server) cleanupRRL() {
+	ticker := time.NewTicker(time.Duration(max(60, s.cfg.DNSRRLWindowSec)) * time.Second)
+	for range ticker.C {
+		now := time.Now()
+		s.mu.Lock()
+		for ip, b := range s.rrl {
+			if now.Sub(b.lastSeen) > time.Duration(max(300, s.cfg.DNSRRLIdleSec))*time.Second {
+				delete(s.rrl, ip)
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
 func (s *Server) allowIP(ip string) bool {
 	if !s.cfg.DNSRRLEnabled {
 		return true
 	}
 	now := time.Now()
+	rate := float64(max(1, s.cfg.DNSRRLRate))
+	burst := float64(max(s.cfg.DNSRRLBurst, s.cfg.DNSRRLRate))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	b, ok := s.rrl[ip]
 	if !ok {
-		b = &tokenBucket{tokens: float64(s.cfg.DNSRRLRate), last: now}
+		b = &tokenBucket{tokens: burst, last: now, lastSeen: now}
 		s.rrl[ip] = b
 	}
 	elapsed := now.Sub(b.last).Seconds()
-	b.tokens += elapsed * float64(s.cfg.DNSRRLRate)
-	if b.tokens > float64(s.cfg.DNSRRLRate) {
-		b.tokens = float64(s.cfg.DNSRRLRate)
+	b.tokens += elapsed * rate
+	if b.tokens > burst {
+		b.tokens = burst
 	}
 	b.last = now
+	b.lastSeen = now
 	if b.tokens < 1 {
 		return false
 	}
@@ -106,24 +157,45 @@ func (s *Server) allowIP(ip string) bool {
 	return true
 }
 
+func (s *Server) refusalCode() int {
+	if s.cfg.DNSAbuseRcode == "SERVFAIL" {
+		return mdns.RcodeServerFailure
+	}
+	return mdns.RcodeRefused
+}
+
+func parseRemoteHost(addr net.Addr) string {
+	host, _, err := net.SplitHostPort(addr.String())
+	if err == nil {
+		return host
+	}
+	return addr.String()
+}
+
 func (s *Server) handle(w mdns.ResponseWriter, r *mdns.Msg) {
 	start := time.Now()
-	defer func() { s.latencyNS = append(s.latencyNS, time.Since(start).Nanoseconds()) }()
+	proto := "udp"
+	if _, ok := w.RemoteAddr().(*net.TCPAddr); ok {
+		proto = "tcp"
+	}
+	defer s.dnsLatency.WithLabelValues(proto).Observe(time.Since(start).Seconds())
+
 	m := new(mdns.Msg)
 	m.SetReply(r)
 	m.Authoritative = true
 	m.Compress = true
-	m.SetEdns0(uint16(s.cfg.DNSMaxUDPSize), true)
+	if o := r.IsEdns0(); o != nil {
+		m.SetEdns0(uint16(s.cfg.DNSMaxUDPSize), true)
+	}
 	if len(r.Question) == 0 {
+		s.dnsRcodes.WithLabelValues(mdns.RcodeToString[m.Rcode]).Inc()
 		_ = w.WriteMsg(m)
 		return
 	}
-	host, _, _ := net.SplitHostPort(w.RemoteAddr().String())
-	if host == "" {
-		host = w.RemoteAddr().String()
-	}
+	host := parseRemoteHost(w.RemoteAddr())
 	if !s.allowIP(host) {
-		m.Rcode = mdns.RcodeServerFailure
+		m.Rcode = s.refusalCode()
+		s.dnsRcodes.WithLabelValues(mdns.RcodeToString[m.Rcode]).Inc()
 		_ = w.WriteMsg(m)
 		return
 	}
@@ -132,6 +204,7 @@ func (s *Server) handle(w mdns.ResponseWriter, r *mdns.Msg) {
 		if s.currentTCP.Load() >= int64(s.cfg.DNSMaxTCP) || s.tcpPerIP[host] >= s.cfg.DNSPerIPTCP {
 			s.mu.Unlock()
 			m.Rcode = mdns.RcodeRefused
+			s.dnsRcodes.WithLabelValues(mdns.RcodeToString[m.Rcode]).Inc()
 			_ = w.WriteMsg(m)
 			return
 		}
@@ -146,16 +219,19 @@ func (s *Server) handle(w mdns.ResponseWriter, r *mdns.Msg) {
 		}()
 	}
 	q := r.Question[0]
+	s.dnsQtypes.WithLabelValues(mdns.TypeToString[q.Qtype]).Inc()
 	if c, ok := s.queryCounts[q.Qtype]; ok {
 		c.Add(1)
 	}
-	if q.Qclass == mdns.ClassCHAOS {
-		m.Answer = []mdns.RR{&mdns.TXT{Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeTXT, Class: mdns.ClassCHAOS, Ttl: 0}, Txt: []string{"ok"}}}
+	if q.Qclass == mdns.ClassCHAOS && strings.EqualFold(q.Name, "version.bind.") {
+		m.Answer = []mdns.RR{&mdns.TXT{Hdr: mdns.RR_Header{Name: q.Name, Rrtype: mdns.TypeTXT, Class: mdns.ClassCHAOS, Ttl: 0}, Txt: []string{s.cfg.ChaosVersion}}}
+		s.dnsRcodes.WithLabelValues(mdns.RcodeToString[m.Rcode]).Inc()
 		_ = w.WriteMsg(m)
 		return
 	}
 	if q.Qtype == mdns.TypeAXFR || q.Qtype == mdns.TypeIXFR {
 		m.Rcode = mdns.RcodeRefused
+		s.dnsRcodes.WithLabelValues(mdns.RcodeToString[m.Rcode]).Inc()
 		_ = w.WriteMsg(m)
 		return
 	}
@@ -164,6 +240,7 @@ func (s *Server) handle(w mdns.ResponseWriter, r *mdns.Msg) {
 	zone := LongestZone(qName, zones)
 	if zone == "" {
 		m.Rcode = mdns.RcodeRefused
+		s.dnsRcodes.WithLabelValues(mdns.RcodeToString[m.Rcode]).Inc()
 		_ = w.WriteMsg(m)
 		return
 	}
@@ -174,20 +251,51 @@ func (s *Server) handle(w mdns.ResponseWriter, r *mdns.Msg) {
 			m.Rcode = mdns.RcodeNameError
 		}
 		m.Ns = append(m.Ns, soa)
+		s.dnsRcodes.WithLabelValues(mdns.RcodeToString[m.Rcode]).Inc()
 		_ = w.WriteMsg(m)
 		return
 	}
 	if q.Qtype == mdns.TypeANY {
-		if len(recs) > 1 {
+		switch s.cfg.DNSAnyMode {
+		case "refuse":
+			m.Rcode = mdns.RcodeRefused
+			s.dnsRcodes.WithLabelValues(mdns.RcodeToString[m.Rcode]).Inc()
+			_ = w.WriteMsg(m)
+			return
+		case "single":
 			recs = recs[:1]
+		default:
+			if len(recs) > max(1, s.cfg.DNSAnyLimit) {
+				recs = recs[:max(1, s.cfg.DNSAnyLimit)]
+			}
 		}
 	}
-	m.Answer = recs
-	if w.LocalAddr().Network() == "udp" && m.Len() > s.cfg.DNSMaxUDPSize {
+	m.Answer = fitAnswers(r, m, recs, s.cfg.DNSMaxUDPSize)
+	if w.LocalAddr().Network() == "udp" && len(m.Answer) < len(recs) {
 		m.Truncated = true
-		m.Answer = nil
 	}
+	s.dnsRcodes.WithLabelValues(mdns.RcodeToString[m.Rcode]).Inc()
 	_ = w.WriteMsg(m)
+}
+
+func fitAnswers(req, resp *mdns.Msg, recs []mdns.RR, maxUDP int) []mdns.RR {
+	if maxUDP <= 0 {
+		maxUDP = 1232
+	}
+	if req == nil || req.MsgHdr.Response || len(recs) == 0 {
+		return recs
+	}
+	out := make([]mdns.RR, 0, len(recs))
+	for _, rr := range recs {
+		candidate := append(append([]mdns.RR{}, out...), rr)
+		resp.Answer = candidate
+		if resp.Len() > maxUDP {
+			break
+		}
+		out = candidate
+	}
+	resp.Answer = out
+	return out
 }
 
 func (s *Server) allZones() ([]string, error) {
@@ -228,7 +336,7 @@ func (s *Server) lookup(zoneID int64, fqdn string, qt uint16, zone, remote strin
 	}
 	rows, _ := s.db.Query(`SELECT type,ttl,data_json,name FROM records WHERE zone_id=? AND enabled=1 AND (name=? OR name='*')`, zoneID, rel)
 	defer rows.Close()
-	var out []mdns.RR
+	var exact, wildcard []mdns.RR
 	haveCNAME := false
 	for rows.Next() {
 		var typ, data, recName string
@@ -241,11 +349,9 @@ func (s *Server) lookup(zoneID int64, fqdn string, qt uint16, zone, remote strin
 			continue
 		}
 		h := mdns.RR_Header{Name: mdns.Fqdn(fqdn), Rrtype: mdns.StringToType[typ], Class: mdns.ClassINET, Ttl: uint32(ttl)}
-		if recName == "*" && rel != "*" {
-			h.Name = mdns.Fqdn(fqdn)
-		}
 		var p map[string]any
 		_ = json.Unmarshal([]byte(data), &p)
+		var rr mdns.RR
 		switch typ {
 		case "A":
 			ip := ""
@@ -256,10 +362,10 @@ func (s *Server) lookup(zoneID int64, fqdn string, qt uint16, zone, remote strin
 			} else {
 				ip, _ = p["ip"].(string)
 			}
-			out = append(out, &mdns.A{Hdr: h, A: net.ParseIP(ip)})
+			rr = &mdns.A{Hdr: h, A: net.ParseIP(ip)}
 		case "AAAA":
 			ip, _ := p["ip"].(string)
-			out = append(out, &mdns.AAAA{Hdr: h, AAAA: net.ParseIP(ip)})
+			rr = &mdns.AAAA{Hdr: h, AAAA: net.ParseIP(ip)}
 		case "TXT":
 			vals := []string{}
 			if arr, ok := p["texts"].([]any); ok {
@@ -269,19 +375,51 @@ func (s *Server) lookup(zoneID int64, fqdn string, qt uint16, zone, remote strin
 					}
 				}
 			}
-			out = append(out, &mdns.TXT{Hdr: h, Txt: vals})
+			rr = &mdns.TXT{Hdr: h, Txt: vals}
 		case "CNAME":
 			target, _ := p["target"].(string)
 			haveCNAME = true
-			out = append(out, &mdns.CNAME{Hdr: h, Target: mdns.Fqdn(target)})
+			rr = &mdns.CNAME{Hdr: h, Target: mdns.Fqdn(target)}
 		case "MX":
 			exchange, _ := p["exchange"].(string)
 			pref, _ := p["preference"].(float64)
-			out = append(out, &mdns.MX{Hdr: h, Mx: mdns.Fqdn(exchange), Preference: uint16(pref)})
+			rr = &mdns.MX{Hdr: h, Mx: mdns.Fqdn(exchange), Preference: uint16(pref)}
 		case "NS":
 			host, _ := p["host"].(string)
-			out = append(out, &mdns.NS{Hdr: h, Ns: mdns.Fqdn(host)})
+			rr = &mdns.NS{Hdr: h, Ns: mdns.Fqdn(host)}
+		case "SRV":
+			target, _ := p["target"].(string)
+			port, _ := p["port"].(float64)
+			priority, _ := p["priority"].(float64)
+			weight, _ := p["weight"].(float64)
+			rr = &mdns.SRV{Hdr: h, Target: mdns.Fqdn(target), Port: uint16(port), Priority: uint16(priority), Weight: uint16(weight)}
+		case "CAA":
+			tag, _ := p["tag"].(string)
+			value, _ := p["value"].(string)
+			flags, _ := p["flags"].(float64)
+			rr = &mdns.CAA{Hdr: h, Flag: uint8(flags), Tag: tag, Value: value}
+		case "SOA":
+			ns, _ := p["ns"].(string)
+			mbox, _ := p["mbox"].(string)
+			serial, _ := p["serial"].(float64)
+			refresh, _ := p["refresh"].(float64)
+			retry, _ := p["retry"].(float64)
+			expire, _ := p["expire"].(float64)
+			minttl, _ := p["minttl"].(float64)
+			rr = &mdns.SOA{Hdr: h, Ns: mdns.Fqdn(ns), Mbox: mdns.Fqdn(mbox), Serial: uint32(serial), Refresh: uint32(refresh), Retry: uint32(retry), Expire: uint32(expire), Minttl: uint32(minttl)}
 		}
+		if rr == nil {
+			continue
+		}
+		if recName == "*" {
+			wildcard = append(wildcard, rr)
+		} else {
+			exact = append(exact, rr)
+		}
+	}
+	out := exact
+	if len(out) == 0 {
+		out = wildcard
 	}
 	if haveCNAME {
 		cn := []mdns.RR{}
@@ -293,4 +431,11 @@ func (s *Server) lookup(zoneID int64, fqdn string, qt uint16, zone, remote strin
 		return cn
 	}
 	return out
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

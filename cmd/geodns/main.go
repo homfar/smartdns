@@ -48,6 +48,7 @@ func main() {
 	seedAdmin(dbConn, cfg.AdminUser, cfg.AdminPassword)
 	gp := geo.NewMMDB(cfg.MMDBPath, logger)
 	sm := syncmod.New(dbConn, !cfg.NoSync, cfg.PeerURL, cfg.SyncToken, cfg.SyncAllowlist, cfg.NodeID)
+	sm.SetPrimary(cfg.SyncPrimary)
 	dns := dnssrv.New(dbConn, gp, cfg)
 	if err := dns.Start(); err != nil {
 		panic(err)
@@ -59,7 +60,7 @@ func main() {
 	go periodicBackup(cfg.DBPath, cfg.DBBackupSec, logger)
 	go periodicIntegrity(dbConn, cfg.DBIntegritySec, logger)
 	go func() {
-		t := time.NewTicker(10 * time.Second)
+		t := time.NewTicker(time.Duration(cfg.MMDBReloadSec) * time.Second)
 		defer t.Stop()
 		for range t.C {
 			gp.ReloadIfChanged()
