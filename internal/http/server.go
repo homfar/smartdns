@@ -164,6 +164,13 @@ func (s *Server) adminAllowed(remote string) bool {
 	return false
 }
 func (s *Server) render(w http.ResponseWriter, n string, d any) { _ = s.t.ExecuteTemplate(w, n, d) }
+
+func (s *Server) dbError(w http.ResponseWriter, msg string, err error) {
+	if s.logger != nil {
+		s.logger.Error(msg, "err", err)
+	}
+	http.Error(w, "internal server error", http.StatusInternalServerError)
+}
 func (s *Server) rand() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
@@ -247,7 +254,14 @@ func (s *Server) loginPost(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
 	u, p := r.FormValue("username"), r.FormValue("password")
 	var hash string
-	_ = s.db.QueryRow(`SELECT password_hash FROM users WHERE username=?`, u).Scan(&hash)
+	if err := s.db.QueryRow(`SELECT password_hash FROM users WHERE username=?`, u).Scan(&hash); err != nil {
+		if err != sql.ErrNoRows {
+			s.dbError(w, "login query failed", err)
+			return
+		}
+		http.Error(w, "invalid", 401)
+		return
+	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(p)) != nil {
 		http.Error(w, "invalid", 401)
 		return
@@ -277,8 +291,12 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 }
 
 // remaining handlers mostly unchanged
-func (s *Server) zonesList(w http.ResponseWriter, r *http.Request) { /* unchanged below */
-	rows, _ := s.db.Query(`SELECT id,domain,enabled FROM zones ORDER BY domain`)
+func (s *Server) zonesList(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Query(`SELECT id,domain,enabled FROM zones ORDER BY domain`)
+	if err != nil {
+		s.dbError(w, "zonesList query failed", err)
+		return
+	}
 	defer rows.Close()
 	type z struct {
 		ID      int
@@ -288,8 +306,15 @@ func (s *Server) zonesList(w http.ResponseWriter, r *http.Request) { /* unchange
 	var zs []z
 	for rows.Next() {
 		var x z
-		_ = rows.Scan(&x.ID, &x.Domain, &x.Enabled)
+		if err := rows.Scan(&x.ID, &x.Domain, &x.Enabled); err != nil {
+			s.dbError(w, "zonesList scan failed", err)
+			return
+		}
 		zs = append(zs, x)
+	}
+	if err := rows.Err(); err != nil {
+		s.dbError(w, "zonesList rows failed", err)
+		return
 	}
 	c, _ := r.Cookie("sid")
 	s.mu.Lock()
@@ -333,6 +358,12 @@ func (s *Server) recordCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if typ == "AAAA" {
+		if err := validate.AAAAData(data); err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+	}
 	if err := validate.TTL(ttl, s.cfg.TTLMin, s.cfg.TTLMax); err != nil {
 		http.Error(w, err.Error(), 400)
 		return
@@ -340,14 +371,20 @@ func (s *Server) recordCreate(w http.ResponseWriter, r *http.Request) {
 	name := r.FormValue("name")
 	if typ == "CNAME" {
 		var c int
-		_ = s.db.QueryRow(`SELECT COUNT(1) FROM records WHERE zone_id=? AND name=? AND enabled=1 AND type<>'CNAME'`, zid, name).Scan(&c)
+		if err := s.db.QueryRow(`SELECT COUNT(1) FROM records WHERE zone_id=? AND name=? AND enabled=1 AND type<>'CNAME'`, zid, name).Scan(&c); err != nil {
+			s.dbError(w, "recordCreate cname check failed", err)
+			return
+		}
 		if c > 0 {
 			http.Error(w, "cname exclusivity violation", 400)
 			return
 		}
 	} else {
 		var c int
-		_ = s.db.QueryRow(`SELECT COUNT(1) FROM records WHERE zone_id=? AND name=? AND enabled=1 AND type='CNAME'`, zid, name).Scan(&c)
+		if err := s.db.QueryRow(`SELECT COUNT(1) FROM records WHERE zone_id=? AND name=? AND enabled=1 AND type='CNAME'`, zid, name).Scan(&c); err != nil {
+			s.dbError(w, "recordCreate cname conflict check failed", err)
+			return
+		}
 		if c > 0 {
 			http.Error(w, "cname exclusivity violation", 400)
 			return

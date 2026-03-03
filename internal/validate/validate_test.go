@@ -13,3 +13,12 @@ func TestAData(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestAAAAData(t *testing.T) {
+	if err := AAAAData(`{"ip":"2001:db8::1"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := AAAAData(`{"ip":"1.2.3.4"}`); err == nil {
+		t.Fatal("expected ipv6 validation error")
+	}
+}

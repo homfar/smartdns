@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -49,6 +50,9 @@ type Server struct {
 	dnsLatency *prometheus.HistogramVec
 	dnsRcodes  *prometheus.CounterVec
 	dnsQtypes  *prometheus.CounterVec
+
+	cleanupCancel context.CancelFunc
+	invalidLogTS  atomic.Int64
 }
 
 func New(db *sql.DB, gp geo.Provider, cfg config.Config) *Server {
@@ -68,7 +72,9 @@ func New(db *sql.DB, gp geo.Provider, cfg config.Config) *Server {
 		addrs = []string{cfg.DNSAddr}
 	}
 	s := &Server{db: db, geo: gp, cfg: cfg, rrl: map[string]*tokenBucket{}, tcpPerIP: map[string]int{}, queryCounts: qc, dnsLatency: dnsLatencyVec, dnsRcodes: dnsRcodesVec, dnsQtypes: dnsQtypesVec}
-	go s.cleanupRRL()
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cleanupCancel = cancel
+	go s.cleanupRRL(ctx)
 	return s
 }
 
@@ -90,6 +96,9 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
+	if s.cleanupCancel != nil {
+		s.cleanupCancel()
+	}
 	var errs []error
 	for _, srv := range s.udp {
 		errs = append(errs, srv.ShutdownContext(ctx))
@@ -115,17 +124,23 @@ func LongestZone(name string, zones []string) string {
 	return best
 }
 
-func (s *Server) cleanupRRL() {
+func (s *Server) cleanupRRL(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(max(60, s.cfg.DNSRRLWindowSec)) * time.Second)
-	for range ticker.C {
-		now := time.Now()
-		s.mu.Lock()
-		for ip, b := range s.rrl {
-			if now.Sub(b.lastSeen) > time.Duration(max(300, s.cfg.DNSRRLIdleSec))*time.Second {
-				delete(s.rrl, ip)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			s.mu.Lock()
+			for ip, b := range s.rrl {
+				if now.Sub(b.lastSeen) > time.Duration(max(300, s.cfg.DNSRRLIdleSec))*time.Second {
+					delete(s.rrl, ip)
+				}
 			}
+			s.mu.Unlock()
 		}
-		s.mu.Unlock()
 	}
 }
 
@@ -214,7 +229,11 @@ func (s *Server) handle(w mdns.ResponseWriter, r *mdns.Msg) {
 		defer func() {
 			s.mu.Lock()
 			s.currentTCP.Add(-1)
-			s.tcpPerIP[host]--
+			if s.tcpPerIP[host] <= 1 {
+				delete(s.tcpPerIP, host)
+			} else {
+				s.tcpPerIP[host]--
+			}
 			s.mu.Unlock()
 		}()
 	}
@@ -236,7 +255,14 @@ func (s *Server) handle(w mdns.ResponseWriter, r *mdns.Msg) {
 		return
 	}
 	qName := validate.NormalizeDomain(q.Name)
-	zones, _ := s.allZones()
+	zones, err := s.allZones()
+	if err != nil {
+		slog.Error("dns allZones failed", "err", err)
+		m.Rcode = mdns.RcodeServerFailure
+		s.dnsRcodes.WithLabelValues(mdns.RcodeToString[m.Rcode]).Inc()
+		_ = w.WriteMsg(m)
+		return
+	}
 	zone := LongestZone(qName, zones)
 	if zone == "" {
 		m.Rcode = mdns.RcodeRefused
@@ -244,8 +270,22 @@ func (s *Server) handle(w mdns.ResponseWriter, r *mdns.Msg) {
 		_ = w.WriteMsg(m)
 		return
 	}
-	zoneID, soa := s.zoneInfo(zone)
-	recs := s.lookup(zoneID, qName, q.Qtype, zone, host)
+	zoneID, soa, err := s.zoneInfo(zone)
+	if err != nil {
+		slog.Error("dns zoneInfo failed", "zone", zone, "err", err)
+		m.Rcode = mdns.RcodeServerFailure
+		s.dnsRcodes.WithLabelValues(mdns.RcodeToString[m.Rcode]).Inc()
+		_ = w.WriteMsg(m)
+		return
+	}
+	recs, err := s.lookup(zoneID, qName, q.Qtype, zone, host)
+	if err != nil {
+		slog.Error("dns lookup failed", "zone", zone, "qname", qName, "qtype", q.Qtype, "err", err)
+		m.Rcode = mdns.RcodeServerFailure
+		s.dnsRcodes.WithLabelValues(mdns.RcodeToString[m.Rcode]).Inc()
+		_ = w.WriteMsg(m)
+		return
+	}
 	if len(recs) == 0 {
 		if !s.nameExists(zoneID, qName, zone) {
 			m.Rcode = mdns.RcodeNameError
@@ -307,18 +347,26 @@ func (s *Server) allZones() ([]string, error) {
 	out := []string{}
 	for rows.Next() {
 		var z string
-		_ = rows.Scan(&z)
+		if err := rows.Scan(&z); err != nil {
+			return nil, err
+		}
 		out = append(out, z)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
-func (s *Server) zoneInfo(domain string) (int64, mdns.RR) {
+func (s *Server) zoneInfo(domain string) (int64, mdns.RR, error) {
 	var id int64
 	var mname, rname string
 	var serial int64
 	var refresh, retry, expire, minimum int
-	_ = s.db.QueryRow(`SELECT id,soa_mname,soa_rname,soa_serial,soa_refresh,soa_retry,soa_expire,soa_minimum FROM zones WHERE domain=?`, domain).Scan(&id, &mname, &rname, &serial, &refresh, &retry, &expire, &minimum)
-	return id, &mdns.SOA{Hdr: mdns.RR_Header{Name: mdns.Fqdn(domain), Rrtype: mdns.TypeSOA, Class: mdns.ClassINET, Ttl: uint32(minimum)}, Ns: mdns.Fqdn(mname), Mbox: mdns.Fqdn(rname), Serial: uint32(serial), Refresh: uint32(refresh), Retry: uint32(retry), Expire: uint32(expire), Minttl: uint32(minimum)}
+	err := s.db.QueryRow(`SELECT id,soa_mname,soa_rname,soa_serial,soa_refresh,soa_retry,soa_expire,soa_minimum FROM zones WHERE domain=?`, domain).Scan(&id, &mname, &rname, &serial, &refresh, &retry, &expire, &minimum)
+	if err != nil {
+		return 0, nil, err
+	}
+	return id, &mdns.SOA{Hdr: mdns.RR_Header{Name: mdns.Fqdn(domain), Rrtype: mdns.TypeSOA, Class: mdns.ClassINET, Ttl: uint32(minimum)}, Ns: mdns.Fqdn(mname), Mbox: mdns.Fqdn(rname), Serial: uint32(serial), Refresh: uint32(refresh), Retry: uint32(retry), Expire: uint32(expire), Minttl: uint32(minimum)}, nil
 }
 func (s *Server) nameExists(zoneID int64, fqdn, zone string) bool {
 	rel := "@"
@@ -326,22 +374,30 @@ func (s *Server) nameExists(zoneID int64, fqdn, zone string) bool {
 		rel = strings.TrimSuffix(strings.TrimSuffix(fqdn, "."+zone), ".")
 	}
 	var c int
-	_ = s.db.QueryRow(`SELECT COUNT(1) FROM records WHERE zone_id=? AND enabled=1 AND (name=? OR name='*')`, zoneID, rel).Scan(&c)
+	if err := s.db.QueryRow(`SELECT COUNT(1) FROM records WHERE zone_id=? AND enabled=1 AND (name=? OR name='*')`, zoneID, rel).Scan(&c); err != nil {
+		slog.Error("dns nameExists failed", "zoneID", zoneID, "fqdn", fqdn, "err", err)
+		return false
+	}
 	return c > 0
 }
-func (s *Server) lookup(zoneID int64, fqdn string, qt uint16, zone, remote string) []mdns.RR {
+func (s *Server) lookup(zoneID int64, fqdn string, qt uint16, zone, remote string) ([]mdns.RR, error) {
 	rel := "@"
 	if fqdn != zone {
 		rel = strings.TrimSuffix(strings.TrimSuffix(fqdn, "."+zone), ".")
 	}
-	rows, _ := s.db.Query(`SELECT type,ttl,data_json,name FROM records WHERE zone_id=? AND enabled=1 AND (name=? OR name='*')`, zoneID, rel)
+	rows, err := s.db.Query(`SELECT type,ttl,data_json,name FROM records WHERE zone_id=? AND enabled=1 AND (name=? OR name='*')`, zoneID, rel)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var exact, wildcard []mdns.RR
 	haveCNAME := false
 	for rows.Next() {
 		var typ, data, recName string
 		var ttl int
-		_ = rows.Scan(&typ, &ttl, &data, &recName)
+		if err := rows.Scan(&typ, &ttl, &data, &recName); err != nil {
+			return nil, err
+		}
 		if qt != mdns.TypeANY && mdns.StringToType[typ] != qt {
 			continue
 		}
@@ -350,7 +406,10 @@ func (s *Server) lookup(zoneID int64, fqdn string, qt uint16, zone, remote strin
 		}
 		h := mdns.RR_Header{Name: mdns.Fqdn(fqdn), Rrtype: mdns.StringToType[typ], Class: mdns.ClassINET, Ttl: uint32(ttl)}
 		var p map[string]any
-		_ = json.Unmarshal([]byte(data), &p)
+		if err := json.Unmarshal([]byte(data), &p); err != nil {
+			slog.Warn("skipping malformed record json", "zoneID", zoneID, "fqdn", fqdn, "type", typ, "err", err)
+			continue
+		}
 		var rr mdns.RR
 		switch typ {
 		case "A":
@@ -362,10 +421,20 @@ func (s *Server) lookup(zoneID int64, fqdn string, qt uint16, zone, remote strin
 			} else {
 				ip, _ = p["ip"].(string)
 			}
-			rr = &mdns.A{Hdr: h, A: net.ParseIP(ip)}
+			parsed := net.ParseIP(ip)
+			if parsed == nil || parsed.To4() == nil {
+				s.logInvalidIP("A", fqdn, ip)
+				continue
+			}
+			rr = &mdns.A{Hdr: h, A: parsed.To4()}
 		case "AAAA":
 			ip, _ := p["ip"].(string)
-			rr = &mdns.AAAA{Hdr: h, AAAA: net.ParseIP(ip)}
+			parsed := net.ParseIP(ip)
+			if parsed == nil || parsed.To4() != nil {
+				s.logInvalidIP("AAAA", fqdn, ip)
+				continue
+			}
+			rr = &mdns.AAAA{Hdr: h, AAAA: parsed}
 		case "TXT":
 			vals := []string{}
 			if arr, ok := p["texts"].([]any); ok {
@@ -417,6 +486,9 @@ func (s *Server) lookup(zoneID int64, fqdn string, qt uint16, zone, remote strin
 			exact = append(exact, rr)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	out := exact
 	if len(out) == 0 {
 		out = wildcard
@@ -428,9 +500,20 @@ func (s *Server) lookup(zoneID int64, fqdn string, qt uint16, zone, remote strin
 				cn = append(cn, rr)
 			}
 		}
-		return cn
+		return cn, nil
 	}
-	return out
+	return out, nil
+}
+
+func (s *Server) logInvalidIP(recordType, fqdn, ip string) {
+	now := time.Now().Unix()
+	last := s.invalidLogTS.Load()
+	if now-last < 5 {
+		return
+	}
+	if s.invalidLogTS.CompareAndSwap(last, now) {
+		slog.Warn("skipping invalid DNS record IP", "type", recordType, "fqdn", fqdn, "ip", ip)
+	}
 }
 
 func max(a, b int) int {
