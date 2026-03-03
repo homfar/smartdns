@@ -35,3 +35,75 @@
   - با `NO_SYNC=false` هم دوره‌ای و هم دکمه Sync now فعال می‌شود.
 - نکات پروداکشن: TLS با reverse proxy، فایروال، بکاپ sqlite، اجرای امن با دسترسی حداقلی.
 - عیب‌یابی: نبود MMDB، مشکل دسترسی پورت ۵۳، NXDOMAIN/REFUSED، محدودیت geo بر اساس resolver.
+
+## Production Deployment Guide
+- Run as non-root with `CAP_NET_BIND_SERVICE` or use high ports behind LB.
+- Enable DNS hardening defaults:
+  - `DNS_RRL_ENABLED=true`
+  - `DNS_RRL_RATE=20`
+  - `DNS_MAX_TCP=100`
+  - `DNS_MAX_UDP_SIZE=1232`
+- API hardening options:
+  - `ADMIN_ALLOWLIST=10.0.0.10,10.0.0.11`
+  - `API_RATE_PER_MIN=120`
+  - `GEO_REQUIRED=true` in GEO-critical deployments.
+
+### Reverse proxy (nginx)
+```nginx
+server {
+  listen 443 ssl;
+  server_name dns-admin.example.com;
+  location / {
+    proxy_pass http://127.0.0.1:5555;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Host $host;
+  }
+}
+```
+
+### systemd unit
+```ini
+[Unit]
+Description=SmartDNS GeoDNS
+After=network.target
+
+[Service]
+User=smartdns
+Group=smartdns
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ExecStart=/usr/local/bin/geodns
+Restart=always
+Environment=DNS_RRL_ENABLED=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Firewall rules example
+- Allow: `53/udp`, `53/tcp`, `5555/tcp` (admin restricted source only).
+- Deny all other inbound by default.
+
+### Kernel tuning recommendations
+- `net.core.rmem_max=8388608`
+- `net.core.wmem_max=8388608`
+- `net.ipv4.udp_mem=8388608 12582912 16777216`
+- `net.ipv4.tcp_syncookies=1`
+
+### Benchmark + load test
+- Install `dnsperf`.
+- Run `scripts/load_test.sh 127.0.0.1 53`.
+
+### Backup & restore
+- Auto-backup uses `DB_BACKUP_SEC` and creates timestamped `.bak` files beside DB.
+- Restore: stop service, copy desired `.bak` to DB path, start service.
+
+### Disaster recovery
+1. Stop writes (maintenance mode).
+2. Restore latest consistent DB backup.
+3. Validate with `PRAGMA integrity_check`.
+4. Resume and force `/sync/now` from primary.
+
+### MMDB update procedure
+1. Replace MMDB file atomically.
+2. Service hot-reloads in background (10s poll).
+3. Verify `/readyz` includes `"mmdb":true`.

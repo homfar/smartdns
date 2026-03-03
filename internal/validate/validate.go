@@ -4,11 +4,27 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"regexp"
 	"strings"
 )
 
+var fqdnLabel = regexp.MustCompile(`^[a-z0-9-]{1,63}$`)
+
 func NormalizeDomain(d string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(d)), ".")
+}
+
+func FQDN(d string) error {
+	n := NormalizeDomain(d)
+	if n == "" || len(n) > 253 {
+		return errors.New("invalid fqdn")
+	}
+	for _, p := range strings.Split(n, ".") {
+		if !fqdnLabel.MatchString(p) || strings.HasPrefix(p, "-") || strings.HasSuffix(p, "-") {
+			return errors.New("invalid fqdn label")
+		}
+	}
+	return nil
 }
 
 func TTL(ttl, min, max int) error {
