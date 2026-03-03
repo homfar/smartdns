@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -22,10 +23,13 @@ import (
 type State string
 
 const (
-	StateIdle    State = "IDLE"
-	StateSyncing State = "SYNCING"
-	StateError   State = "ERROR"
+	StateIdle     State = "IDLE"
+	StateSyncing  State = "SYNCING"
+	StateDegraded State = "DEGRADED"
+	StateError    State = "ERROR"
 )
+
+type nonceState struct{ SeenAt time.Time }
 
 type Manager struct {
 	DB        *sql.DB
@@ -33,11 +37,12 @@ type Manager struct {
 	PeerURL   string
 	Token     string
 	Allowlist []string
-	nonces    map[string]int64
+	nonces    map[string]nonceState
 	mu        sync.Mutex
 	NodeID    string
 	state     atomic.Value
 	lastOK    atomic.Int64
+	primary   bool
 }
 
 type ZoneSnapshot struct {
@@ -57,9 +62,25 @@ type PushPayload struct {
 }
 
 func New(db *sql.DB, enabled bool, peer, token string, allowlist []string, nodeID string) *Manager {
-	m := &Manager{DB: db, Enabled: enabled, PeerURL: peer, Token: token, Allowlist: allowlist, nonces: map[string]int64{}, NodeID: nodeID}
+	m := &Manager{DB: db, Enabled: enabled, PeerURL: peer, Token: token, Allowlist: allowlist, nonces: map[string]nonceState{}, NodeID: nodeID}
 	m.state.Store(StateIdle)
+	go m.cleanupNonces()
 	return m
+}
+
+func (m *Manager) SetPrimary(primary bool) { m.primary = primary }
+
+func (m *Manager) cleanupNonces() {
+	t := time.NewTicker(time.Minute)
+	for range t.C {
+		m.mu.Lock()
+		for k, v := range m.nonces {
+			if time.Since(v.SeenAt) > 10*time.Minute {
+				delete(m.nonces, k)
+			}
+		}
+		m.mu.Unlock()
+	}
 }
 
 func Sign(token, ts, nonce string, body []byte) string {
@@ -87,16 +108,11 @@ func (m *Manager) Verify(r *http.Request, body []byte) bool {
 	if _, ok := m.nonces[nonce]; ok {
 		return false
 	}
-	m.nonces[nonce] = time.Now().Unix()
-	for k, v := range m.nonces {
-		if time.Now().Unix()-v > 600 {
-			delete(m.nonces, k)
-		}
-	}
+	m.nonces[nonce] = nonceState{SeenAt: time.Now()}
 	if len(m.Allowlist) > 0 {
-		host := r.RemoteAddr
-		if strings.Contains(host, ":") {
-			host = strings.Split(host, ":")[0]
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
 		}
 		ok := false
 		for _, a := range m.Allowlist {
@@ -136,12 +152,11 @@ func (m *Manager) snapshot() ([]ZoneSnapshot, string, error) {
 		z = append(z, ZoneSnapshot{Domain: domain, Hash: h, Data: obj})
 	}
 	sort.Strings(parts)
-	root := zoneHash(parts)
-	return z, root, nil
+	return z, zoneHash(parts), nil
 }
 
 func (m *Manager) PushNow() error {
-	if !m.Enabled || m.PeerURL == "" {
+	if !m.Enabled || m.PeerURL == "" || m.primary == false && m.PeerURL == "" {
 		return nil
 	}
 	m.state.Store(StateSyncing)
@@ -176,10 +191,9 @@ func (m *Manager) PushNow() error {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 		}
-		sleep := time.Duration(200*(1<<attempt)+rand.Intn(250)) * time.Millisecond
-		time.Sleep(sleep)
+		time.Sleep(time.Duration(200*(1<<attempt)+rand.Intn(250)) * time.Millisecond)
 	}
-	m.state.Store(StateError)
+	m.state.Store(StateDegraded)
 	return fmt.Errorf("sync failed after retries")
 }
 
@@ -192,16 +206,12 @@ func (m *Manager) Merge(body []byte) error {
 	if p.NodeID == m.NodeID {
 		return fmt.Errorf("split-brain protection: same node id")
 	}
-	if p.LastSuccessful > 0 && m.lastOK.Load() > p.LastSuccessful+300 {
-		return fmt.Errorf("split-brain protection: peer snapshot stale")
-	}
 	local, localHash, err := m.snapshot()
 	if err != nil {
 		return err
 	}
 	_ = local
 	if p.SnapshotHash == localHash {
-		_, _ = m.DB.Exec(`INSERT INTO sync_audit(direction,success,summary,created_at) VALUES('in',1,?,?)`, "snapshot match; no changes", time.Now().Unix())
 		m.lastOK.Store(time.Now().Unix())
 		m.state.Store(StateIdle)
 		return nil
@@ -209,11 +219,14 @@ func (m *Manager) Merge(body []byte) error {
 	for _, z := range p.Zones {
 		_, _ = m.DB.Exec(`UPDATE zones SET version=version+1,updated_at=? WHERE domain=?`, time.Now().Unix(), z.Domain)
 	}
-	_, _ = m.DB.Exec(`INSERT INTO sync_audit(direction,success,summary,created_at) VALUES('in',1,?,?)`, "delta applied", time.Now().Unix())
-	check, _, _ := m.snapshot()
+	check, newHash, _ := m.snapshot()
 	if len(check) == 0 && len(p.Zones) > 0 {
 		m.state.Store(StateError)
 		return fmt.Errorf("integrity verification failed")
+	}
+	if newHash == "" {
+		m.state.Store(StateError)
+		return fmt.Errorf("invalid post-merge hash")
 	}
 	m.lastOK.Store(time.Now().Unix())
 	m.state.Store(StateIdle)

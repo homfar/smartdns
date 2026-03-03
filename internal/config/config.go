@@ -36,6 +36,19 @@ type Config struct {
 	GEORequired     bool
 	DBBackupSec     int
 	DBIntegritySec  int
+	DNSAnyMode      string
+	DNSAnyLimit     int
+	DNSAbuseRcode   string
+	DNSRRLBurst     int
+	DNSRRLWindowSec int
+	DNSRRLIdleSec   int
+	DNSAddrs        []string
+	ChaosVersion    string
+	CookieSecure    bool
+	SessionTTLHours int
+	SessionMax      int
+	SyncPrimary     bool
+	MMDBReloadSec   int
 }
 
 func Load() Config {
@@ -69,6 +82,19 @@ func Load() Config {
 		GEORequired:     getenv("GEO_REQUIRED", "false") == "true",
 		DBBackupSec:     atoi(getenv("DB_BACKUP_SEC", "300"), 300),
 		DBIntegritySec:  atoi(getenv("DB_INTEGRITY_SEC", "600"), 600),
+		DNSAnyMode:      strings.ToLower(getenv("DNS_ANY_MODE", "minimal")),
+		DNSAnyLimit:     atoi(getenv("DNS_ANY_LIMIT", "5"), 5),
+		DNSAbuseRcode:   strings.ToUpper(getenv("DNS_ABUSE_RCODE", "REFUSED")),
+		DNSRRLBurst:     atoi(getenv("DNS_RRL_BURST", "40"), 40),
+		DNSRRLWindowSec: atoi(getenv("DNS_RRL_WINDOW_SEC", "60"), 60),
+		DNSRRLIdleSec:   atoi(getenv("DNS_RRL_IDLE_SEC", "300"), 300),
+		DNSAddrs:        split(getenv("DNS_ADDRS", "")),
+		ChaosVersion:    getenv("DNS_CHAOS_VERSION", "smartdns"),
+		CookieSecure:    getenv("COOKIE_SECURE", "false") == "true",
+		SessionTTLHours: atoi(getenv("SESSION_TTL_HOURS", "12"), 12),
+		SessionMax:      atoi(getenv("SESSION_MAX", "10000"), 10000),
+		SyncPrimary:     getenv("SYNC_PRIMARY", "false") == "true",
+		MMDBReloadSec:   atoi(getenv("MMDB_RELOAD_SEC", "30"), 30),
 	}
 }
 
