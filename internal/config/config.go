@@ -22,6 +22,20 @@ type Config struct {
 	SyncIntervalSec int
 	TTLMin          int
 	TTLMax          int
+	DNSRRLEnabled   bool
+	DNSRRLRate      int
+	DNSMaxTCP       int
+	DNSMaxUDPSize   int
+	DNSPerIPTCP     int
+	DNSTimeoutMS    int
+	GeoFallback     string
+	AdminAllowlist  []string
+	APIRatePerMin   int
+	RunAsUser       string
+	RunAsGroup      string
+	GEORequired     bool
+	DBBackupSec     int
+	DBIntegritySec  int
 }
 
 func Load() Config {
@@ -41,6 +55,20 @@ func Load() Config {
 		SyncIntervalSec: atoi(getenv("SYNC_INTERVAL_SEC", "30"), 30),
 		TTLMin:          atoi(getenv("TTL_MIN", "30"), 30),
 		TTLMax:          atoi(getenv("TTL_MAX", "86400"), 86400),
+		DNSRRLEnabled:   getenv("DNS_RRL_ENABLED", "true") == "true",
+		DNSRRLRate:      atoi(getenv("DNS_RRL_RATE", "20"), 20),
+		DNSMaxTCP:       atoi(getenv("DNS_MAX_TCP", "100"), 100),
+		DNSMaxUDPSize:   atoi(getenv("DNS_MAX_UDP_SIZE", "1232"), 1232),
+		DNSPerIPTCP:     atoi(getenv("DNS_PER_IP_TCP", "10"), 10),
+		DNSTimeoutMS:    atoi(getenv("DNS_QUERY_TIMEOUT_MS", "2000"), 2000),
+		GeoFallback:     strings.ToUpper(getenv("GEO_FALLBACK", "FOREIGN")),
+		AdminAllowlist:  split(getenv("ADMIN_ALLOWLIST", "")),
+		APIRatePerMin:   atoi(getenv("API_RATE_PER_MIN", "120"), 120),
+		RunAsUser:       getenv("RUN_AS_USER", ""),
+		RunAsGroup:      getenv("RUN_AS_GROUP", ""),
+		GEORequired:     getenv("GEO_REQUIRED", "false") == "true",
+		DBBackupSec:     atoi(getenv("DB_BACKUP_SEC", "300"), 300),
+		DBIntegritySec:  atoi(getenv("DB_INTEGRITY_SEC", "600"), 600),
 	}
 }
 
