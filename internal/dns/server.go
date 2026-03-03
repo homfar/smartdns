@@ -85,7 +85,7 @@ func (s *Server) Start() error {
 		addrs = []string{s.cfg.DNSAddr}
 	}
 	for _, addr := range addrs {
-		udp := &mdns.Server{Addr: addr, Net: "udp", Handler: h, ReusePort: true, UDPSize: uint16(s.cfg.DNSMaxUDPSize), ReadTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond, WriteTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond}
+		udp := &mdns.Server{Addr: addr, Net: "udp", Handler: h, ReusePort: true, UDPSize: s.cfg.DNSMaxUDPSize, ReadTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond, WriteTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond}
 		tcp := &mdns.Server{Addr: addr, Net: "tcp", Handler: h, ReusePort: true, ReadTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond, WriteTimeout: time.Duration(s.cfg.DNSTimeoutMS) * time.Millisecond, MaxTCPQueries: 64}
 		s.udp = append(s.udp, udp)
 		s.tcp = append(s.tcp, tcp)
