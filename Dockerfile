@@ -1,8 +1,13 @@
-FROM golang:1.22 AS builder
+ARG GO_IMAGE=golang:1.22
+ARG RUNTIME_IMAGE=alpine:3.20
+
+FROM ${GO_IMAGE} AS builder
 WORKDIR /src
 COPY . .
 RUN go mod tidy && CGO_ENABLED=0 go build -o /out/geodns ./cmd/geodns
-FROM alpine:3.20
+
+ARG RUNTIME_IMAGE
+FROM ${RUNTIME_IMAGE}
 RUN adduser -D app
 WORKDIR /app
 COPY --from=builder /out/geodns /app/geodns

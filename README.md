@@ -8,6 +8,7 @@
   1. `cp .env.example .env`
   2. Put `GeoLite2-Country.mmdb` in `./mmdb`
   3. `docker compose up -d --build`
+- If Docker Hub is blocked in your network, set `GO_IMAGE` and `RUNTIME_IMAGE` in `.env` to reachable mirror images.
 - Login `/login`, create zone, then records.
 - Sync:
   - `NO_SYNC=true` disables sync and endpoint.
@@ -27,6 +28,7 @@
   ۱) `cp .env.example .env`
   ۲) فایل `GeoLite2-Country.mmdb` را داخل `./mmdb` قرار دهید.
   ۳) `docker compose up -d --build`
+- اگر Docker Hub از سمت شبکه شما دردسترس نیست، در فایل `.env` مقدار `GO_IMAGE` و `RUNTIME_IMAGE` را روی رجیستری آینه تنظیم کنید (مثلاً آینه سازمانی/داخلی).
 - وارد `/login` شوید، زون بسازید و رکورد اضافه کنید.
 - همگام‌سازی:
   - با `NO_SYNC=true` همگام‌سازی غیرفعال است.
